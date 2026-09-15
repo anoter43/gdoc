@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+# gdoc - Generate man docs
+# Copyright (C) 2026 anoter43<74D756F4B3EAF32E6F1294928D214D55C4F7479D>
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import os
+import re
+import sys
+import time
+
+VERSION = "1.0"
+
+FORMAT_BOLD = 1
+FORMAT_UNDERLINE = 2
+
+ALIGN_LEFT = 0
+ALIGN_CENTER = 1
+ALIGN_RIGHT = 2
+ALIGN_LEFT_EXPAND = 3
+ALIGN_CENTER_EXPAND = 4
+ALIGN_RIGHT_EXPAND = 5
+
+ALIGN_CHARS = ("l", "c", "r", "lx", "cx", "rx")
+
+
+def is_alnum(ch):
+    return ch is not None and ch < 0x80 and (
+        0x30 <= ch <= 0x39 or 0x41 <= ch <= 0x5A or 0x61 <= ch <= 0x7A
+    )
+
+
+class Parser:
+    def __init__(self, data, output):
+        self.data = data
+        self.pos = 0
+        self.output = output
+        self.line = 1
+        self.col = 1
+        self.queue = []
+        self.flags = 0
+        self.str = None
+        self.stridx = 0
+        self.fmt_line = 0
+        self.fmt_col = 0
+        self.indent = 0
+
+    def fatal(self, err):
+        sys.stderr.write("Error at %d:%d: %s\n" % (self.line, self.col, err))
+        self.output.flush()
+        sys.exit(1)
+
+    def getch(self):
+        if self.queue:
+            return self.queue.pop()
+        if self.str is not None:
+            if self.stridx >= len(self.str):
+                self.str = None
+                return None
+            ch = ord(self.str[self.stridx])
+            self.stridx += 1
+            return ch
+        if self.pos >= len(self.data):
+            return None
+        ch = ord(self.data[self.pos])
+        self.pos += 1
+        if ch == 0x0A:
+            self.col = 0
+            self.line += 1
+        else:
+            self.col += 1
+        return ch
+
+    def pushch(self, ch):
+        if ch is not None:
+            self.queue.append(ch)
+
+    def pushstr(self, string):
+        self.str = string
+        self.stridx = 0
+
+    def fputch(self, ch):
+        self.output.write(chr(ch))
+
+    def roff_macro(self, cmd, *args):
+        self.output.write("." + cmd)
+        for arg in args:
+            self.output.write(' "')
+            for ch in arg:
+                if ch == '"':
+                    self.output.write("\\")
+                self.output.write(ch)
+            self.output.write('"')
+        self.output.write("\n")
+
+    def parse_section(self):
+        section = []
+        while True:
+            ch = self.getch()
+            if ch is None:
+                break
+            if is_alnum(ch):
+                section.append(chr(ch))
+            elif ch == 0x29:  # )
+                if not section:
+                    break
+                string = "".join(section)
+                match = re.match(r"[0-9]+", string)
+                if match is None:
+                    self.fatal("Expected section digit")
+                    break
+                sec = int(match.group())
+                if sec < 0 or sec > 9:
+                    self.fatal("Expected section between 0 and 9")
+                    break
+                return string
+            else:
+                self.fatal("Expected alphanumerical character or )")
+                break
+        self.fatal("Expected manual section")
+        return None
+
+    def parse_extra(self):
+        extra = ['"']
+        while True:
+            ch = self.getch()
+            if ch is None:
+                break
+            if ch == 0x22:  # "
+                extra.append('"')
+                return "".join(extra)
+            elif ch == 0x0A:
+                self.fatal("Unclosed extra preamble field")
+                break
+            else:
+                extra.append(chr(ch))
+        return None
+
+    def parse_preamble(self):
+        name = []
+        ex = 0
+        extras = [None, None]
+        section = None
+
+        source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        if source_date_epoch is not None:
+            match = re.match(r"[0-9]+", source_date_epoch)
+            if match is None:
+                sys.stderr.write(
+                    "$SOURCE_DATE_EPOCH: No digits were found: %s\n"
+                    % source_date_epoch
+                )
+                sys.exit(1)
+            date_time = int(match.group())
+        else:
+            date_time = int(time.time())
+        date = time.strftime("%Y-%m-%d", time.gmtime(date_time))
+
+        while True:
+            ch = self.getch()
+            if ch is None:
+                break
+            if is_alnum(ch) or ch in (0x5F, 0x2D, 0x2E):  # _ - .
+                name.append(chr(ch))
+            elif ch == 0x28:  # (
+                section = self.parse_section()
+            elif ch == 0x22:  # "
+                if ex == 2:
+                    self.fatal("Too many extra preamble fields")
+                extras[ex] = self.parse_extra()
+                ex += 1
+            elif ch == 0x0A:
+                if not name:
+                    self.fatal("Expected preamble")
+                if section is None:
+                    self.fatal("Expected manual section")
+                self.output.write(
+                    '.TH "%s" "%s" "%s"' % ("".join(name), section, date)
+                )
+                if extras[0]:
+                    self.output.write(" %s" % extras[0])
+                if extras[1]:
+                    self.output.write(" %s" % extras[1])
+                self.output.write("\n")
+                break
+            elif section is None:
+                self.fatal(
+                    "Name characters must be A-Z, a-z, 0-9, `-`, `_`, or `.`"
+                )
+
+    def parse_format(self, fmt):
+        formats = {FORMAT_BOLD: "B", FORMAT_UNDERLINE: "I"}
+        if self.flags:
+            if self.flags & ~fmt:
+                char = "*" if self.flags == FORMAT_BOLD else "_"
+                self.fatal(
+                    "Cannot nest inline formatting (began with %c at %d:%d)"
+                    % (char, self.fmt_line, self.fmt_col)
+                )
+            self.output.write("\\fR")
+        else:
+            self.output.write("\\f%s" % formats[fmt])
+            self.fmt_line = self.line
+            self.fmt_col = self.col
+        self.flags ^= fmt
+
+    def parse_linebreak(self):
+        plus = self.getch()
+        if plus != 0x2B:  # +
+            self.output.write("+")
+            self.pushch(plus)
+            return False
+        lf = self.getch()
+        if lf != 0x0A:
+            self.output.write("+")
+            self.pushch(lf)
+            self.pushch(plus)
+            return False
+        ch = self.getch()
+        if ch == 0x0A:
+            self.fatal(
+                "Explicit line breaks cannot be followed by a blank line"
+            )
+        self.pushch(ch)
+        self.output.write("\n.br\n")
+        return True
+
+    def parse_text(self):
+        last = 0x20
+        i = 0
+        while True:
+            ch = self.getch()
+            if ch is None:
+                break
+            if ch == 0x5C:  # backslash
+                ch = self.getch()
+                if ch is None:
+                    self.fatal("Unexpected EOF")
+                elif ch == 0x5C:
+                    self.output.write("\\\\")
+                else:
+                    self.fputch(ch)
+            elif ch == 0x2A:  # *
+                self.parse_format(FORMAT_BOLD)
+            elif ch == 0x5F:  # _
+                nxt = self.getch()
+                if not is_alnum(last) or (
+                    (self.flags & FORMAT_UNDERLINE) and not is_alnum(nxt)
+                ):
+                    self.parse_format(FORMAT_UNDERLINE)
+                else:
+                    self.fputch(ch)
+                if nxt is None:
+                    return
+                self.pushch(nxt)
+            elif ch == 0x2B:  # +
+                if self.parse_linebreak():
+                    last = 0x0A
+            elif ch == 0x0A:
+                self.fputch(ch)
+                return
+            elif ch == 0x2E:  # .
+                if not i:
+                    self.output.write("\\&.\\&")
+                else:
+                    last = ch
+                    self.fputch(ch)
+                    self.output.write("\\&")
+            elif ch in (0x21, 0x3F):  # ! ?
+                last = ch
+                self.fputch(ch)
+                self.output.write("\\&")
+            else:
+                last = ch
+                self.fputch(ch)
+            i += 1
+
+    def parse_heading(self):
+        level = 1
+        while True:
+            ch = self.getch()
+            if ch is None:
+                break
+            if ch == 0x23:  # #
+                level += 1
+            elif ch == 0x20:
+                break
+            else:
+                self.fatal(
+                    "Invalid start of heading (probably needs a space)"
+                )
+        if level == 1:
+            self.output.write(".SH ")
+        elif level == 2:
+            self.output.write(".SS ")
+        else:
+            self.fatal("Only headings up to two levels deep are permitted")
+        while True:
+            ch = self.getch()
+            if ch is None:
+                break
+            self.fputch(ch)
+            if ch == 0x0A:
+                break
+
+    def parse_indent(self, indent, write):
+        i = 0
+        ch = self.getch()
+        while ch == 0x09:
+            i += 1
+            ch = self.getch()
+        self.pushch(ch)
+        if (ch is None or ch == 0x0A) and indent != 0:
+            return indent
+        if write:
+            if i - indent > 1:
+                self.fatal("Indented by an amount greater than 1")
+            elif i < indent:
+                for _ in range(indent - i):
+                    self.roff_macro("RE")
+            elif i == indent + 1:
+                self.output.write(".RS 4\n")
+        return i
+
+    def list_header(self, num):
+        self.output.write(".RS 4\n")
+        self.output.write(".ie n \\{\\\n")
+        if num == -1:
+            self.output.write(
+                "\\h'-0%d'%s\\h'+03'\\c\n"
+                % (5 if num >= 10 else 4, "\\(bu")
+            )
+        else:
+            self.output.write(
+                "\\h'-0%d'%d.\\h'+03'\\c\n"
+                % (5 if num >= 10 else 4, num)
+            )
+        self.output.write(".\\}\n")
+        self.output.write(".el \\{\\\n")
+        if num == -1:
+            self.output.write(".IP %s 4\n" % "\\(bu")
+        else:
+            self.output.write(".IP %d. 4\n" % num)
+            num = num + 1
+        self.output.write(".\\}\n")
+        return num
+
+    def parse_list(self, num):
+        ch = self.getch()
+        if ch != 0x20:
+            self.fatal("Expected space before start of list entry")
+        num = self.list_header(num)
+        self.parse_text()
+        while True:
+            self.indent = self.parse_indent(self.indent, True)
+            ch = self.getch()
+            if ch is None:
+                break
+            if ch == 0x20:
+                ch = self.getch()
+                if ch != 0x20:
+                    self.fatal(
+                        "Expected two spaces for list entry continuation"
+                    )
+                self.parse_text()
+            elif ch in (0x2D, 0x2E):  # - .
+                ch = self.getch()
+                if ch != 0x20:
+                    self.fatal("Expected space before start of list entry")
+                self.roff_macro("RE")
+                num = self.list_header(num)
+                self.parse_text()
+            else:
+                self.output.write("\n")
+                self.pushch(ch)
+                break
+        self.roff_macro("RE")
+
+    def parse_literal(self):
+        ch = self.getch()
+        if ch != 0x60 or self.getch() != 0x60 or self.getch() != 0x0A:
+            self.fatal("Expected ``` and a newline to begin literal block")
+        stops = 0
+        self.roff_macro("nf")
+        self.output.write(".RS 4\n")
+        check_indent = True
+        while True:
+            if check_indent:
+                under = self.parse_indent(self.indent, False)
+                if under < self.indent:
+                    self.fatal("Cannot deindent in literal block")
+                while under > self.indent:
+                    under -= 1
+                    self.output.write("\t")
+                check_indent = False
+            ch = self.getch()
+            if ch is None:
+                break
+            if ch == 0x60:  # `
+                stops += 1
+                if stops == 3:
+                    if self.getch() != 0x0A:
+                        self.fatal(
+                            "Expected literal block to end with newline"
+                        )
+                    self.roff_macro("fi")
+                    self.roff_macro("RE")
+                    return
+            else:
+                while stops:
+                    self.output.write("`")
+                    stops -= 1
+                if ch == 0x2E:  # .
+                    self.output.write("\\&.")
+                elif ch == 0x5C:  # backslash
+                    ch = self.getch()
+                    if ch is None:
+                        self.fatal("Unexpected EOF")
+                    elif ch == 0x5C:
+                        self.output.write("\\\\")
+                    else:
+                        self.fputch(ch)
+                elif ch == 0x0A:
+                    check_indent = True
+                    self.fputch(ch)
+                else:
+                    self.fputch(ch)
+
+    def parse_table(self, style):
+        table = []
+        currow = None
+        prevrow = None
+        curcell = None
+        column = 0
+        self.pushch(0x7C)  # |
+        while True:
+            ch = self.getch()
+            if ch is None:
+                break
+            if ch == 0x0A:
+                break
+            if ch == 0x7C:  # |
+                prevrow = currow
+                currow = []
+                table.append(currow)
+                curcell = {"align": ALIGN_LEFT, "contents": []}
+                currow.append(curcell)
+                column = 0
+            elif ch == 0x3A:  # :
+                if currow is None:
+                    self.fatal(
+                        "Cannot start a column without starting a row first"
+                    )
+                curcell = {"align": ALIGN_LEFT, "contents": []}
+                currow.append(curcell)
+                column += 1
+            elif ch == 0x20:
+                pass
+            else:
+                self.fatal("Expected either '|' or ':'")
+
+            if ch != 0x20:
+                ch = self.getch()
+                if ch is None:
+                    break
+                if ch == 0x5B:  # [
+                    curcell["align"] = ALIGN_LEFT
+                elif ch == 0x2D:  # -
+                    curcell["align"] = ALIGN_CENTER
+                elif ch == 0x5D:  # ]
+                    curcell["align"] = ALIGN_RIGHT
+                elif ch == 0x3C:  # <
+                    curcell["align"] = ALIGN_LEFT_EXPAND
+                elif ch == 0x3D:  # =
+                    curcell["align"] = ALIGN_CENTER_EXPAND
+                elif ch == 0x3E:  # >
+                    curcell["align"] = ALIGN_RIGHT_EXPAND
+                elif ch == 0x20:
+                    if prevrow is not None:
+                        if column < len(prevrow):
+                            curcell["align"] = prevrow[column]["align"]
+                    else:
+                        self.fatal("No previous row to infer alignment from")
+                else:
+                    self.fatal("Expected one of '[', '-', ']', or ' '")
+                curcell["contents"] = []
+
+            ch = self.getch()
+            if ch == 0x20:
+                while True:
+                    ch = self.getch()
+                    if ch is None:
+                        break
+                    if ch == 0x0A:
+                        break
+                    curcell["contents"].append(ch)
+            elif ch != 0x0A:
+                self.fatal("Expected ' ' or a newline")
+
+            contents = "".join(chr(c) for c in curcell["contents"])
+            if "T{" in contents or "T}" in contents:
+                self.fatal(
+                    "Cells cannot contain T{ or T} due to roff limitations"
+                )
+            if ch is None:
+                break
+
+        if ch is None:
+            return
+
+        self.roff_macro("TS")
+        if style == 0x5B:  # [
+            self.output.write("allbox;")
+        elif style == 0x5D:  # ]
+            self.output.write("box;")
+
+        for idx, row in enumerate(table):
+            parts = [ALIGN_CHARS[cell["align"]] for cell in row]
+            self.output.write(" ".join(parts))
+            self.output.write("." if idx == len(table) - 1 else "")
+            self.output.write("\n")
+
+        for row in table:
+            self.output.write("T{\n")
+            for idx, cell in enumerate(row):
+                self.pushstr("".join(chr(c) for c in cell["contents"]))
+                self.parse_text()
+                if idx < len(row) - 1:
+                    self.output.write("\nT}\tT{\n")
+                else:
+                    self.output.write("\nT}")
+            self.output.write("\n")
+
+        self.roff_macro("TE")
+        self.output.write(".sp 1\n")
+
+    def parse_document(self):
+        while True:
+            self.indent = self.parse_indent(self.indent, True)
+            ch = self.getch()
+            if ch is None:
+                break
+            if ch == 0x3B:  # ;
+                if self.getch() != 0x20:
+                    self.fatal("Expected space after ; to begin comment")
+                while True:
+                    ch = self.getch()
+                    if ch is None or ch == 0x0A:
+                        break
+            elif ch == 0x23:  # #
+                if self.indent != 0:
+                    self.pushch(ch)
+                    self.parse_text()
+                else:
+                    self.parse_heading()
+            elif ch == 0x2D:  # -
+                self.parse_list(-1)
+            elif ch == 0x2E:  # .
+                nxt = self.getch()
+                if nxt == 0x20:
+                    self.pushch(nxt)
+                    self.parse_list(1)
+                else:
+                    self.pushch(nxt)
+                    self.parse_text()
+            elif ch == 0x60:  # `
+                self.parse_literal()
+            elif ch in (0x5B, 0x7C, 0x5D):  # [ | ]
+                if self.indent != 0:
+                    self.fatal("Tables cannot be indented")
+                self.parse_table(ch)
+            elif ch == 0x20:
+                self.fatal("Tabs are required for indentation")
+            elif ch == 0x0A:
+                if self.flags:
+                    char = "*" if self.flags == FORMAT_BOLD else "_"
+                    self.fatal(
+                        "Expected %c before starting new paragraph "
+                        "(began with %c at %d:%d)"
+                        % (char, char, self.fmt_line, self.fmt_col)
+                    )
+                self.roff_macro("P")
+            else:
+                self.pushch(ch)
+                self.parse_text()
+
+    def output_gdoc_preamble(self):
+        self.output.write('.\\" Generated by gdoc %s\n' % VERSION)
+        self.output.write(
+            '.\\" Futhermore, I think that big techs must be destroyed.\n'
+        )
+        self.output.write(".ie \\n(.g .ds Aq \\(aq\n")
+        self.output.write(".el       .ds Aq '\n")
+        self.roff_macro("nh")
+        self.roff_macro("ad l")
+        self.output.write('.\\" Begin generated content:\n')
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "-v":
+        sys.stdout.write("gdoc %s\n" % VERSION)
+        return 0
+    if len(argv) > 1:
+        sys.stderr.write("Usage: gdoc < input.gcd > output.roff\n")
+        return 1
+
+    sys.stdout.reconfigure(encoding="utf-8")
+    data = sys.stdin.buffer.read().decode("utf-8")
+    parser = Parser(data, sys.stdout)
+    parser.output_gdoc_preamble()
+    parser.parse_preamble()
+    parser.parse_document()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

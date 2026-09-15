@@ -1,0 +1,21 @@
+gdoc(1)
+
+# NAME
+
+gdoc - generate *man*(7) manual pages
+
+# SYNOPSIS
+
+*gdoc* < _input_
+
+# DESCRIPTION
+
+The gdoc utility reads *gdoc*(5) syntax from the standard input and writes
+*man*(7) style roff to the standard output.
+
+# SEE ALSO
+
+*gdoc*(5)
+
+# HISTORY
+A fork of scdoc by Drew DeVault.
